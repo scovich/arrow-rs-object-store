@@ -33,8 +33,8 @@ use crate::client::s3::{
     InitiateMultipartUploadResult, ListResponse, PartMetadata,
 };
 use crate::client::{
-    CryptoProvider, DigestAlgorithm, GetOptionsExt, HttpClient, HttpError, HttpResponse,
-    crypto_provider,
+    CredentialContext, CryptoProvider, DigestAlgorithm, GetOptionsExt, HttpClient, HttpError,
+    HttpResponse, crypto_provider,
 };
 use crate::list::{PaginatedListOptions, PaginatedListResult};
 use crate::multipart::PartId;
@@ -220,11 +220,14 @@ impl S3Config {
         format!("{}/{}", self.bucket_endpoint, encode_path(path))
     }
 
-    async fn get_session_credential(&self) -> Result<Option<SessionCredential<'_>>> {
+    async fn get_session_credential(
+        &self,
+        context: &CredentialContext<'_>,
+    ) -> Result<Option<SessionCredential<'_>>> {
         Ok(match self.skip_signature {
             false => {
                 let provider = self.session_provider.as_ref().unwrap_or(&self.credentials);
-                let credential = provider.get_credential().await?;
+                let credential = provider.get_credential_ext(context).await?;
                 Some(SessionCredential {
                     credential,
                     session_token: self.session_provider.is_some(),
@@ -235,9 +238,12 @@ impl S3Config {
         })
     }
 
-    pub(crate) async fn get_credential(&self) -> Result<Option<Arc<AwsCredential>>> {
+    pub(crate) async fn get_credential(
+        &self,
+        context: &CredentialContext<'_>,
+    ) -> Result<Option<Arc<AwsCredential>>> {
         Ok(match self.skip_signature {
-            false => Some(self.credentials.get_credential().await?),
+            false => Some(self.credentials.get_credential_ext(context).await?),
             true => None,
         })
     }
@@ -306,6 +312,7 @@ pub(crate) struct Request<'a> {
     builder: HttpRequestBuilder,
     payload_sha256: Option<[u8; 32]>,
     payload: Option<PutPayload>,
+    extensions: ::http::Extensions,
     use_session_creds: bool,
     idempotent: bool,
     retry_on_conflict: bool,
@@ -401,8 +408,12 @@ impl Request<'_> {
     }
 
     pub(crate) fn with_extensions(self, extensions: ::http::Extensions) -> Self {
-        let builder = self.builder.extensions(extensions);
-        Self { builder, ..self }
+        let builder = self.builder.extensions(extensions.clone());
+        Self {
+            builder,
+            extensions,
+            ..self
+        }
     }
 
     pub(crate) fn with_payload(mut self, payload: PutPayload) -> Result<Self> {
@@ -451,10 +462,14 @@ impl Request<'_> {
     }
 
     pub(crate) async fn send(self) -> Result<HttpResponse, RequestError> {
+        let context = CredentialContext {
+            path: self.path,
+            extensions: &self.extensions,
+        };
         let credential = match self.use_session_creds {
-            true => self.config.get_session_credential().await?,
+            true => self.config.get_session_credential(&context).await?,
             false => {
-                let credential = self.config.get_credential().await?;
+                let credential = self.config.get_credential(&context).await?;
                 credential.map(|credential| SessionCredential {
                     credential,
                     session_token: false,
@@ -513,6 +528,7 @@ impl S3Client {
             builder,
             payload: None,
             payload_sha256: None,
+            extensions: Default::default(),
             config: &self.config,
             use_session_creds: true,
             idempotent: false,
@@ -533,7 +549,12 @@ impl S3Client {
             return Ok(Vec::new());
         }
 
-        let credential = self.config.get_session_credential().await?;
+        let extensions = ::http::Extensions::new();
+        let context = CredentialContext {
+            path: &paths[0],
+            extensions: &extensions,
+        };
+        let credential = self.config.get_session_credential(&context).await?;
         let authorizer = credential.as_ref().map(|x| x.authorizer()).transpose()?;
         let url = format!("{}?delete", self.config.bucket_endpoint);
 
@@ -744,6 +765,7 @@ impl S3Client {
         upload_id: &MultipartId,
         part_idx: usize,
         data: PutPartPayload<'_>,
+        extensions: ::http::Extensions,
     ) -> Result<PartId> {
         let is_copy = matches!(data, PutPartPayload::Copy(_));
         let part = (part_idx + 1).to_string();
@@ -751,6 +773,7 @@ impl S3Client {
         let mut request = self
             .request(Method::PUT, path)
             .query(&[("partNumber", &part), ("uploadId", upload_id)])
+            .with_extensions(extensions)
             .idempotent(true);
 
         request = match data {
@@ -814,9 +837,15 @@ impl S3Client {
         Ok(PartId { content_id })
     }
 
-    pub(crate) async fn abort_multipart(&self, location: &Path, upload_id: &str) -> Result<()> {
+    pub(crate) async fn abort_multipart(
+        &self,
+        location: &Path,
+        upload_id: &str,
+        extensions: ::http::Extensions,
+    ) -> Result<()> {
         self.request(Method::DELETE, location)
             .query(&[("uploadId", upload_id)])
+            .with_extensions(extensions)
             .with_encryption_headers()
             .send()
             .await?;
@@ -830,6 +859,7 @@ impl S3Client {
         upload_id: &str,
         parts: Vec<PartId>,
         mode: CompleteMultipartMode,
+        extensions: ::http::Extensions,
     ) -> Result<PutResult> {
         let parts = if parts.is_empty() {
             // If no parts were uploaded, upload an empty part
@@ -840,6 +870,7 @@ impl S3Client {
                     &upload_id.to_string(),
                     0,
                     PutPartPayload::default(),
+                    extensions.clone(),
                 )
                 .await?;
             vec![part]
@@ -849,11 +880,15 @@ impl S3Client {
         let request = CompleteMultipartUpload::from(parts);
         let body = quick_xml::se::to_string(&request).unwrap();
 
-        let credential = self.config.get_session_credential().await?;
+        let context = CredentialContext {
+            path: location,
+            extensions: &extensions,
+        };
+        let credential = self.config.get_session_credential(&context).await?;
         let authorizer = credential.as_ref().map(|x| x.authorizer()).transpose()?;
         let url = self.config.path_url(location);
 
-        let mut builder = self.client.post(url);
+        let mut builder = self.client.post(url).extensions(extensions);
         if let Some(headers) = self.config.client_options.get_default_headers() {
             builder = builder.headers(headers.clone());
         }
@@ -901,7 +936,12 @@ impl S3Client {
 
     #[cfg(test)]
     pub(crate) async fn get_object_tagging(&self, path: &Path) -> Result<HttpResponse> {
-        let credential = self.config.get_session_credential().await?;
+        let extensions = ::http::Extensions::new();
+        let context = CredentialContext {
+            path,
+            extensions: &extensions,
+        };
+        let credential = self.config.get_session_credential(&context).await?;
         let authorizer = credential.as_ref().map(|x| x.authorizer()).transpose()?;
         let url = format!("{}?tagging", self.config.path_url(path));
         let response = self
@@ -937,7 +977,11 @@ impl GetClient for S3Client {
         path: &Path,
         options: GetOptions,
     ) -> Result<HttpResponse> {
-        let credential = self.config.get_session_credential().await?;
+        let context = CredentialContext {
+            path,
+            extensions: &options.extensions,
+        };
+        let credential = self.config.get_session_credential(&context).await?;
         let authorizer = credential.as_ref().map(|x| x.authorizer()).transpose()?;
         let url = self.config.path_url(path);
         let method = match options.head {
@@ -982,7 +1026,12 @@ impl ListClient for Arc<S3Client> {
         prefix: Option<&str>,
         opts: PaginatedListOptions,
     ) -> Result<PaginatedListResult> {
-        let credential = self.config.get_session_credential().await?;
+        let path = Path::from(prefix.unwrap_or_default());
+        let context = CredentialContext {
+            path: &path,
+            extensions: &opts.extensions,
+        };
+        let credential = self.config.get_session_credential(&context).await?;
         let authorizer = credential.as_ref().map(|x| x.authorizer()).transpose()?;
         let url = self.config.bucket_endpoint.clone();
 
@@ -1416,6 +1465,7 @@ mod tests {
                 "test-upload-id",
                 parts,
                 CompleteMultipartMode::Overwrite,
+                Default::default(),
             )
             .await
             .unwrap();

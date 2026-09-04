@@ -726,8 +726,8 @@ pub mod client;
 
 #[cfg(feature = "cloud-base")]
 pub use client::{
-    ClientConfigKey, ClientOptions, CredentialProvider, StaticCredentialProvider,
-    backoff::BackoffConfig, retry::RetryConfig,
+    ClientConfigKey, ClientOptions, CredentialContext, CredentialProvider,
+    StaticCredentialProvider, backoff::BackoffConfig, retry::RetryConfig,
 };
 
 #[cfg(all(
@@ -1659,7 +1659,8 @@ pub struct GetOptions {
     /// Implementation-specific extensions. Intended for use by [`ObjectStore`] implementations
     /// that need to pass context-specific information (like tracing spans) via trait methods.
     ///
-    /// These extensions are ignored entirely by backends offered through this crate.
+    /// Cloud backends pass these extensions to context-aware credential providers
+    /// and to the underlying HTTP request.
     pub extensions: Extensions,
 }
 
@@ -1926,7 +1927,8 @@ pub struct PutOptions {
     /// Implementation-specific extensions. Intended for use by [`ObjectStore`] implementations
     /// that need to pass context-specific information (like tracing spans) via trait methods.
     ///
-    /// These extensions are ignored entirely by backends offered through this crate.
+    /// Cloud backends pass these extensions to context-aware credential providers
+    /// and to the underlying HTTP request.
     ///
     /// They are also excluded from [`PartialEq`] and [`Eq`].
     pub extensions: Extensions,
@@ -1998,7 +2000,8 @@ pub struct PutMultipartOptions {
     /// Implementation-specific extensions. Intended for use by [`ObjectStore`] implementations
     /// that need to pass context-specific information (like tracing spans) via trait methods.
     ///
-    /// These extensions are ignored entirely by backends offered through this crate.
+    /// Cloud backends pass these extensions to context-aware credential providers
+    /// and to the underlying HTTP request.
     ///
     /// They are also excluded from [`PartialEq`] and [`Eq`].
     pub extensions: Extensions,
@@ -2096,7 +2099,8 @@ pub struct CopyOptions {
     /// Implementation-specific extensions. Intended for use by [`ObjectStore`] implementations
     /// that need to pass context-specific information (like tracing spans) via trait methods.
     ///
-    /// These extensions are ignored entirely by backends offered through this crate.
+    /// Cloud backends pass these extensions to context-aware credential providers
+    /// and to the underlying HTTP request.
     ///
     /// They are also excluded from [`PartialEq`] and [`Eq`].
     pub extensions: Extensions,
@@ -2166,7 +2170,8 @@ pub struct RenameOptions {
     /// Implementation-specific extensions. Intended for use by [`ObjectStore`] implementations
     /// that need to pass context-specific information (like tracing spans) via trait methods.
     ///
-    /// These extensions are ignored entirely by backends offered through this crate.
+    /// Cloud backends pass these extensions to context-aware credential providers
+    /// and to the underlying HTTP request.
     ///
     /// They are also excluded from [`PartialEq`] and [`Eq`].
     pub extensions: Extensions,

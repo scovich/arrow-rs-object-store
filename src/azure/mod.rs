@@ -173,14 +173,11 @@ impl ObjectStore for MicrosoftAzure {
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-        let CopyOptions {
-            mode,
-            extensions: _,
-        } = options;
+        let CopyOptions { mode, extensions } = options;
 
         match mode {
-            CopyMode::Overwrite => self.client.copy_request(from, to, true).await,
-            CopyMode::Create => self.client.copy_request(from, to, false).await,
+            CopyMode::Overwrite => self.client.copy_request(from, to, true, extensions).await,
+            CopyMode::Create => self.client.copy_request(from, to, false, extensions).await,
         }
     }
 }
@@ -287,8 +284,12 @@ impl MultipartUpload for AzureMultiPartUpload {
         let idx = self.part_idx;
         self.part_idx += 1;
         let state = Arc::clone(&self.state);
+        let extensions = self.opts.extensions.clone();
         Box::pin(async move {
-            let part = state.client.put_block(&state.location, idx, data).await?;
+            let part = state
+                .client
+                .put_block(&state.location, idx, data, extensions)
+                .await?;
             state.parts.put(idx, part);
             Ok(())
         })
@@ -395,7 +396,9 @@ impl MultipartStore for MicrosoftAzure {
         part_idx: usize,
         data: PutPayload,
     ) -> Result<PartId> {
-        self.client.put_block(path, part_idx, data).await
+        self.client
+            .put_block(path, part_idx, data, Default::default())
+            .await
     }
 
     async fn complete_multipart(

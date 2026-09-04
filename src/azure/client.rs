@@ -25,8 +25,8 @@ use crate::client::list::ListClient;
 use crate::client::retry::{RetryContext, RetryExt};
 use crate::client::token::{TemporaryToken, TokenCache};
 use crate::client::{
-    CryptoProvider, DigestAlgorithm, GetOptionsExt, HttpClient, HttpError, HttpRequest,
-    HttpResponse, crypto_provider,
+    CredentialContext, CryptoProvider, DigestAlgorithm, GetOptionsExt, HttpClient, HttpError,
+    HttpRequest, HttpResponse, crypto_provider,
 };
 use crate::list::{PaginatedListOptions, PaginatedListResult};
 use crate::multipart::PartId;
@@ -228,11 +228,14 @@ impl AzureConfig {
         credential_sensitive || self.encryption_headers.is_enabled()
     }
 
-    async fn get_credential(&self) -> Result<Option<Arc<AzureCredential>>> {
+    async fn get_credential(
+        &self,
+        context: &CredentialContext<'_>,
+    ) -> Result<Option<Arc<AzureCredential>>> {
         if self.skip_signature {
             Ok(None)
         } else {
-            Some(self.credentials.get_credential().await).transpose()
+            Some(self.credentials.get_credential_ext(context).await).transpose()
         }
     }
 }
@@ -360,6 +363,7 @@ struct PutRequest<'a> {
     config: &'a AzureConfig,
     payload: PutPayload,
     builder: HttpRequestBuilder,
+    extensions: ::http::Extensions,
     idempotent: bool,
 }
 
@@ -418,12 +422,20 @@ impl PutRequest<'_> {
     }
 
     fn with_extensions(self, extensions: ::http::Extensions) -> Self {
-        let builder = self.builder.extensions(extensions);
-        Self { builder, ..self }
+        let builder = self.builder.extensions(extensions.clone());
+        Self {
+            builder,
+            extensions,
+            ..self
+        }
     }
 
     async fn send(self) -> Result<HttpResponse> {
-        let credential = self.config.get_credential().await?;
+        let context = CredentialContext {
+            path: self.path,
+            extensions: &self.extensions,
+        };
+        let credential = self.config.get_credential(&context).await?;
         let sensitive = self.config.is_sensitive(&credential);
         let crypto = self.config.crypto.as_deref();
         let response = self
@@ -714,8 +726,11 @@ impl AzureClient {
         &self.config
     }
 
-    async fn get_credential(&self) -> Result<Option<Arc<AzureCredential>>> {
-        self.config.get_credential().await
+    async fn get_credential(
+        &self,
+        context: &CredentialContext<'_>,
+    ) -> Result<Option<Arc<AzureCredential>>> {
+        self.config.get_credential(context).await
     }
 
     pub(crate) fn crypto(&self) -> Option<&dyn CryptoProvider> {
@@ -731,6 +746,7 @@ impl AzureClient {
             builder,
             payload,
             config: &self.config,
+            extensions: Default::default(),
             idempotent: false,
         }
     }
@@ -786,12 +802,14 @@ impl AzureClient {
         path: &Path,
         _part_idx: usize,
         payload: PutPayload,
+        extensions: ::http::Extensions,
     ) -> Result<PartId> {
         let part_idx = u128::from_be_bytes(rand::rng().random());
         let content_id = format!("{part_idx:032x}");
         let block_id = BASE64_STANDARD.encode(&content_id);
 
         self.put_request(path, payload)
+            .with_extensions(extensions)
             .query(&[("comp", "block"), ("blockid", &block_id)])
             .idempotent(true)
             .send()
@@ -883,7 +901,12 @@ impl AzureClient {
             return Ok(Vec::new());
         }
 
-        let credential = self.get_credential().await?;
+        let extensions = ::http::Extensions::new();
+        let context = CredentialContext {
+            path: &paths[0],
+            extensions: &extensions,
+        };
+        let credential = self.get_credential(&context).await?;
 
         // https://www.ietf.org/rfc/rfc2046
         let random_bytes = rand::random::<[u8; 16]>(); // 128 bits
@@ -935,8 +958,18 @@ impl AzureClient {
     /// and uncommitted blocks / the source block list are not preserved.
     ///
     /// [put-blob-from-url]: https://learn.microsoft.com/en-us/rest/api/storageservices/put-blob-from-url
-    pub(crate) async fn copy_request(&self, from: &Path, to: &Path, overwrite: bool) -> Result<()> {
-        let credential = self.get_credential().await?;
+    pub(crate) async fn copy_request(
+        &self,
+        from: &Path,
+        to: &Path,
+        overwrite: bool,
+        extensions: ::http::Extensions,
+    ) -> Result<()> {
+        let context = CredentialContext {
+            path: to,
+            extensions: &extensions,
+        };
+        let credential = self.get_credential(&context).await?;
         let url = self.config.path_url(to);
         let mut source = self.config.path_url(from);
         let mut source_authorization = None;
@@ -975,6 +1008,7 @@ impl AzureClient {
         let mut builder = self
             .client
             .request(Method::PUT, url.as_str())
+            .extensions(extensions)
             .header(CONTENT_LENGTH, HeaderValue::from_static("0"));
 
         builder = builder.sensitive_header(&COPY_SOURCE, source.to_string());
@@ -1015,7 +1049,14 @@ impl AzureClient {
         start: &DateTime<Utc>,
         end: &DateTime<Utc>,
     ) -> Result<UserDelegationKey> {
-        let credential = self.get_credential().await?;
+        let path = Path::default();
+        let extensions = ::http::Extensions::new();
+        let credential = self
+            .get_credential(&CredentialContext {
+                path: &path,
+                extensions: &extensions,
+            })
+            .await?;
         let url = self.config.service.clone();
 
         let start = start.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -1058,7 +1099,14 @@ impl AzureClient {
     /// Depending on the type of credential, this will either use the account key or a user delegation key.
     /// Since delegation keys are acquired ad-hoc, the signer allows for signing multiple urls with the same key.
     pub(crate) async fn signer(&self, expires_in: Duration) -> Result<AzureSigner> {
-        let credential = self.get_credential().await?;
+        let path = Path::default();
+        let extensions = ::http::Extensions::new();
+        let credential = self
+            .get_credential(&CredentialContext {
+                path: &path,
+                extensions: &extensions,
+            })
+            .await?;
         let signed_start = chrono::Utc::now();
         let signed_expiry = signed_start + expires_in;
         match credential.as_deref() {
@@ -1133,7 +1181,13 @@ impl AzureClient {
 
     #[cfg(test)]
     pub(crate) async fn get_blob_tagging(&self, path: &Path) -> Result<HttpResponse> {
-        let credential = self.get_credential().await?;
+        let extensions = ::http::Extensions::new();
+        let credential = self
+            .get_credential(&CredentialContext {
+                path,
+                extensions: &extensions,
+            })
+            .await?;
         let url = self.config.path_url(path);
         let sensitive = self.config.is_sensitive(&credential);
         // Note: Get blob tags doesn't require us to pass customer provided keys
@@ -1188,7 +1242,12 @@ impl GetClient for AzureClient {
             });
         }
 
-        let credential = self.get_credential().await?;
+        let credential = self
+            .get_credential(&CredentialContext {
+                path,
+                extensions: &options.extensions,
+            })
+            .await?;
         let url = self.config.path_url(path);
         let method = match options.head {
             true => Method::HEAD,
@@ -1243,7 +1302,13 @@ impl ListClient for Arc<AzureClient> {
         prefix: Option<&str>,
         opts: PaginatedListOptions,
     ) -> Result<PaginatedListResult> {
-        let credential = self.get_credential().await?;
+        let path = Path::from(prefix.unwrap_or_default());
+        let credential = self
+            .get_credential(&CredentialContext {
+                path: &path,
+                extensions: &opts.extensions,
+            })
+            .await?;
         let url = self.config.path_url(&Path::default());
 
         let mut query = Vec::with_capacity(6);
@@ -1866,8 +1931,15 @@ mod tests {
 
         let client = AzureClient::new(config, HttpClient::new(Client::new()));
 
-        let credential = client.get_credential().await.unwrap();
         let paths = &[Path::from("a"), Path::from("b"), Path::from("c")];
+        let extensions = ::http::Extensions::new();
+        let credential = client
+            .get_credential(&CredentialContext {
+                path: &paths[0],
+                extensions: &extensions,
+            })
+            .await
+            .unwrap();
 
         let boundary = "batch_statictestboundary".to_string();
 

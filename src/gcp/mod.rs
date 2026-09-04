@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::CopyOptions;
-use crate::client::{CredentialProvider, crypto_provider};
+use crate::client::{CredentialContext, CredentialProvider, crypto_provider};
 use crate::gcp::credential::GCSAuthorizer;
 use crate::signer::{SignedUrlOptions, Signer};
 use crate::util::validate_signed_url_extras;
@@ -117,6 +117,7 @@ struct UploadState {
     path: Path,
     multipart_id: MultipartId,
     parts: Parts,
+    extensions: http::Extensions,
 }
 
 #[async_trait]
@@ -128,7 +129,13 @@ impl MultipartUpload for GCSMultipartUpload {
         Box::pin(async move {
             let part = state
                 .client
-                .put_part(&state.path, &state.multipart_id, idx, payload)
+                .put_part(
+                    &state.path,
+                    &state.multipart_id,
+                    idx,
+                    payload,
+                    state.extensions.clone(),
+                )
                 .await?;
             state.parts.put(idx, part);
             Ok(())
@@ -140,14 +147,23 @@ impl MultipartUpload for GCSMultipartUpload {
 
         self.state
             .client
-            .multipart_complete(&self.state.path, &self.state.multipart_id, parts)
+            .multipart_complete(
+                &self.state.path,
+                &self.state.multipart_id,
+                parts,
+                self.state.extensions.clone(),
+            )
             .await
     }
 
     async fn abort(&mut self) -> Result<()> {
         self.state
             .client
-            .multipart_cleanup(&self.state.path, &self.state.multipart_id)
+            .multipart_cleanup(
+                &self.state.path,
+                &self.state.multipart_id,
+                self.state.extensions.clone(),
+            )
             .await
     }
 }
@@ -168,6 +184,7 @@ impl ObjectStore for GoogleCloudStorage {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
+        let extensions = opts.extensions.clone();
         let upload_id = self.client.multipart_initiate(location, opts).await?;
 
         Ok(Box::new(GCSMultipartUpload {
@@ -177,6 +194,7 @@ impl ObjectStore for GoogleCloudStorage {
                 path: location.clone(),
                 multipart_id: upload_id.clone(),
                 parts: Default::default(),
+                extensions,
             }),
         }))
     }
@@ -220,12 +238,9 @@ impl ObjectStore for GoogleCloudStorage {
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-        let CopyOptions {
-            mode,
-            extensions: _,
-        } = options;
+        let CopyOptions { mode, extensions } = options;
 
-        self.client.copy_request(from, to, mode).await
+        self.client.copy_request(from, to, mode, extensions).await
     }
 }
 
@@ -304,7 +319,9 @@ impl MultipartStore for GoogleCloudStorage {
         part_idx: usize,
         payload: PutPayload,
     ) -> Result<PartId> {
-        self.client.put_part(path, id, part_idx, payload).await
+        self.client
+            .put_part(path, id, part_idx, payload, Default::default())
+            .await
     }
 
     async fn complete_multipart(
@@ -313,11 +330,15 @@ impl MultipartStore for GoogleCloudStorage {
         id: &MultipartId,
         parts: Vec<PartId>,
     ) -> Result<PutResult> {
-        self.client.multipart_complete(path, id, parts).await
+        self.client
+            .multipart_complete(path, id, parts, Default::default())
+            .await
     }
 
     async fn abort_multipart(&self, path: &Path, id: &MultipartId) -> Result<()> {
-        self.client.multipart_cleanup(path, id).await
+        self.client
+            .multipart_cleanup(path, id, Default::default())
+            .await
     }
 }
 
@@ -364,7 +385,14 @@ impl Signer for GoogleCloudStorage {
             source: format!("Unable to parse url {path_url}: {e}").into(),
         })?;
 
-        let signing_credentials = self.signing_credentials().get_credential().await?;
+        let extensions = http::Extensions::new();
+        let signing_credentials = self
+            .signing_credentials()
+            .get_credential_ext(&CredentialContext {
+                path,
+                extensions: &extensions,
+            })
+            .await?;
         let authorizer = GCSAuthorizer::new(signing_credentials);
 
         let crypto = crypto_provider(self.client.config().crypto.as_deref())?;
@@ -400,12 +428,165 @@ mod test {
     use credential::DEFAULT_GCS_BASE_URL;
 
     use crate::ObjectStoreExt;
+    use crate::client::CredentialContext;
     use crate::integration::*;
     use crate::tests::*;
+    use std::sync::Mutex;
 
     use super::*;
 
     const NON_EXISTENT_NAME: &str = "nonexistentname";
+
+    #[derive(Clone, Debug)]
+    struct CredentialScope(&'static str);
+
+    #[derive(Debug, Default)]
+    struct ContextCredentialProvider {
+        calls: Mutex<Vec<(String, Option<&'static str>)>>,
+    }
+
+    #[async_trait]
+    impl CredentialProvider for ContextCredentialProvider {
+        type Credential = GcpCredential;
+
+        async fn get_credential(&self) -> Result<Arc<Self::Credential>> {
+            Ok(Arc::new(GcpCredential {
+                bearer: "legacy".to_string(),
+            }))
+        }
+
+        async fn get_credential_ext(
+            &self,
+            context: &CredentialContext<'_>,
+        ) -> Result<Arc<Self::Credential>> {
+            let scope = context.extensions.get::<CredentialScope>().map(|v| v.0);
+            self.calls
+                .lock()
+                .unwrap()
+                .push((context.path.to_string(), scope));
+            Ok(Arc::new(GcpCredential {
+                bearer: scope
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("path-{}", context.path)),
+            }))
+        }
+    }
+
+    #[cfg(feature = "reqwest")]
+    #[tokio::test]
+    async fn contextual_credentials_select_by_path_and_extension_concurrently() {
+        use http::header::{AUTHORIZATION, CONTENT_LENGTH, ETAG, LAST_MODIFIED};
+
+        let server = crate::client::mock_server::MockServer::new().await;
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        for _ in 0..3 {
+            let captured = Arc::clone(&captured);
+            server.push_fn(move |request| {
+                captured.lock().unwrap().push((
+                    request.uri().path().to_string(),
+                    request
+                        .headers()
+                        .get(AUTHORIZATION)
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_string(),
+                ));
+                http::Response::builder()
+                    .header(CONTENT_LENGTH, 1)
+                    .header(ETAG, "etag")
+                    .header(LAST_MODIFIED, "Tue, 05 Nov 2024 15:01:15 GMT")
+                    .body("x".to_string())
+                    .unwrap()
+            });
+        }
+
+        let provider = Arc::new(ContextCredentialProvider::default());
+        let store = GoogleCloudStorageBuilder::new()
+            .with_bucket_name("bucket")
+            .with_base_url(server.url())
+            .with_credentials(Arc::clone(&provider) as GcpCredentialProvider)
+            .build()
+            .unwrap();
+
+        let path_a = Path::from("a");
+        let path_b = Path::from("b");
+        let (a, b) = tokio::join!(store.get(&path_a), store.get(&path_b));
+        a.unwrap().bytes().await.unwrap();
+        b.unwrap().bytes().await.unwrap();
+
+        let mut extensions = http::Extensions::new();
+        extensions.insert(CredentialScope("extension"));
+        store
+            .get_opts(
+                &Path::from("c"),
+                GetOptions {
+                    extensions,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+
+        let captured = captured.lock().unwrap();
+        assert!(captured.contains(&("/bucket/a".to_string(), "Bearer path-a".to_string())));
+        assert!(captured.contains(&("/bucket/b".to_string(), "Bearer path-b".to_string())));
+        assert!(captured.contains(&("/bucket/c".to_string(), "Bearer extension".to_string())));
+    }
+
+    #[cfg(feature = "reqwest")]
+    #[tokio::test]
+    async fn multipart_preserves_credential_extensions() {
+        let server = crate::client::mock_server::MockServer::new().await;
+        server.push(http::Response::new(
+            "<InitiateMultipartUploadResult><UploadId>upload</UploadId></InitiateMultipartUploadResult>"
+                .to_string(),
+        ));
+        server.push(
+            http::Response::builder()
+                .header(http::header::ETAG, "part")
+                .body(String::new())
+                .unwrap(),
+        );
+        server.push(http::Response::new(
+            "<CompleteMultipartUploadResult><ETag>complete</ETag></CompleteMultipartUploadResult>"
+                .to_string(),
+        ));
+
+        let provider = Arc::new(ContextCredentialProvider::default());
+        let store = GoogleCloudStorageBuilder::new()
+            .with_bucket_name("bucket")
+            .with_base_url(server.url())
+            .with_credentials(Arc::clone(&provider) as GcpCredentialProvider)
+            .build()
+            .unwrap();
+
+        let mut extensions = http::Extensions::new();
+        extensions.insert(CredentialScope("multipart"));
+        let mut upload = store
+            .put_multipart_opts(
+                &Path::from("object"),
+                PutMultipartOptions {
+                    extensions,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        upload.put_part("data".into()).await.unwrap();
+        upload.complete().await.unwrap();
+
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert!(
+            calls
+                .iter()
+                .all(|(path, scope)| path == "object" && *scope == Some("multipart"))
+        );
+    }
 
     #[tokio::test]
     async fn gcs_test() {

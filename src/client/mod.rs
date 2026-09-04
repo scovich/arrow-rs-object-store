@@ -1038,6 +1038,15 @@ impl GetOptionsExt for HttpRequestBuilder {
     }
 }
 
+/// Context for resolving credentials for an object store operation
+#[derive(Debug)]
+pub struct CredentialContext<'a> {
+    /// The object path associated with the operation
+    pub path: &'a Path,
+    /// Typed, operation-specific request extensions
+    pub extensions: &'a ::http::Extensions,
+}
+
 /// Provides credentials for use when signing requests
 #[async_trait]
 pub trait CredentialProvider: std::fmt::Debug + Send + Sync {
@@ -1046,6 +1055,18 @@ pub trait CredentialProvider: std::fmt::Debug + Send + Sync {
 
     /// Return a credential
     async fn get_credential(&self) -> Result<Arc<Self::Credential>>;
+
+    /// Return a credential for the provided operation context
+    ///
+    /// The default implementation delegates to [`Self::get_credential`] for
+    /// backwards compatibility with providers that don't use request context.
+    async fn get_credential_ext(
+        &self,
+        context: &CredentialContext<'_>,
+    ) -> Result<Arc<Self::Credential>> {
+        let _ = context;
+        self.get_credential().await
+    }
 }
 
 /// A static set of credentials
@@ -1139,6 +1160,33 @@ pub(crate) use cloud::*;
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn credential_provider_ext_falls_back_to_legacy_method() {
+        #[derive(Debug)]
+        struct LegacyProvider;
+
+        #[async_trait]
+        impl CredentialProvider for LegacyProvider {
+            type Credential = &'static str;
+
+            async fn get_credential(&self) -> Result<Arc<Self::Credential>> {
+                Ok(Arc::new("legacy"))
+            }
+        }
+
+        let path = Path::from("table/object");
+        let extensions = ::http::Extensions::new();
+        let credential = LegacyProvider
+            .get_credential_ext(&CredentialContext {
+                path: &path,
+                extensions: &extensions,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(*credential, "legacy");
+    }
 
     #[test]
     fn client_test_config_from_map() {

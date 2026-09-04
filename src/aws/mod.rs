@@ -40,9 +40,9 @@ use std::{sync::Arc, time::Duration};
 use url::Url;
 
 use crate::aws::client::{CompleteMultipartMode, PutPartPayload, RequestError, S3Client};
-use crate::client::CredentialProvider;
 use crate::client::get::GetClientExt;
 use crate::client::list::{ListClient, ListClientExt};
+use crate::client::{CredentialContext, CredentialProvider};
 use crate::multipart::{MultipartStore, PartId};
 use crate::signer::{SignedUrlOptions, Signer};
 use crate::util::{STRICT_ENCODE_SET, validate_signed_url_extras};
@@ -202,7 +202,14 @@ impl Signer for AmazonS3 {
         )?;
 
         let crypto = self.client.config.crypto()?;
-        let credential = self.credentials().get_credential().await?;
+        let extensions = http::Extensions::new();
+        let credential = self
+            .credentials()
+            .get_credential_ext(&CredentialContext {
+                path,
+                extensions: &extensions,
+            })
+            .await?;
         let authorizer = AwsAuthorizer::new(&credential, "s3", &self.client.config.region)
             .with_request_payer(self.client.config.request_payer)
             .with_crypto(crypto);
@@ -313,6 +320,7 @@ impl ObjectStore for AmazonS3 {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
+        let extensions = opts.extensions.clone();
         let upload_id = self.client.create_multipart(location, opts).await?;
 
         Ok(Box::new(S3MultiPartUpload {
@@ -322,6 +330,7 @@ impl ObjectStore for AmazonS3 {
                 location: location.clone(),
                 upload_id: upload_id.clone(),
                 parts: Default::default(),
+                extensions,
             }),
         }))
     }
@@ -400,15 +409,13 @@ impl ObjectStore for AmazonS3 {
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-        let CopyOptions {
-            mode,
-            extensions: _,
-        } = options;
+        let CopyOptions { mode, extensions } = options;
 
         match mode {
             CopyMode::Overwrite => {
                 self.client
                     .copy_request(from, to)
+                    .with_extensions(extensions)
                     .idempotent(true)
                     .send()
                     .await?;
@@ -423,13 +430,25 @@ impl ObjectStore for AmazonS3 {
                     Some(S3CopyIfNotExists::Multipart) => {
                         let upload_id = self
                             .client
-                            .create_multipart(to, PutMultipartOptions::default())
+                            .create_multipart(
+                                to,
+                                PutMultipartOptions {
+                                    extensions: extensions.clone(),
+                                    ..Default::default()
+                                },
+                            )
                             .await?;
 
                         let res = async {
                             let part_id = self
                                 .client
-                                .put_part(to, &upload_id, 0, PutPartPayload::Copy(from))
+                                .put_part(
+                                    to,
+                                    &upload_id,
+                                    0,
+                                    PutPartPayload::Copy(from),
+                                    extensions.clone(),
+                                )
                                 .await?;
                             match self
                                 .client
@@ -438,6 +457,7 @@ impl ObjectStore for AmazonS3 {
                                     &upload_id,
                                     vec![part_id],
                                     CompleteMultipartMode::Create,
+                                    extensions.clone(),
                                 )
                                 .await
                             {
@@ -456,7 +476,10 @@ impl ObjectStore for AmazonS3 {
                         // lifecycle rule if guaranteed cleanup is required, as we
                         // cannot protect against an ill-timed process crash.
                         if res.is_err() {
-                            let _ = self.client.abort_multipart(to, &upload_id).await;
+                            let _ = self
+                                .client
+                                .abort_multipart(to, &upload_id, extensions)
+                                .await;
                         }
 
                         return res;
@@ -468,7 +491,10 @@ impl ObjectStore for AmazonS3 {
                     }
                 };
 
-                let req = self.client.copy_request(from, to);
+                let req = self
+                    .client
+                    .copy_request(from, to)
+                    .with_extensions(extensions);
                 match req.header(k, v).send().await {
                     Err(RequestError::Retry { source, path })
                         if source.status() == Some(status) =>
@@ -498,6 +524,7 @@ struct UploadState {
     location: Path,
     upload_id: String,
     client: Arc<S3Client>,
+    extensions: http::Extensions,
 }
 
 #[async_trait]
@@ -514,6 +541,7 @@ impl MultipartUpload for S3MultiPartUpload {
                     &state.upload_id,
                     idx,
                     PutPartPayload::Part(data),
+                    state.extensions.clone(),
                 )
                 .await?;
             state.parts.put(idx, part);
@@ -531,6 +559,7 @@ impl MultipartUpload for S3MultiPartUpload {
                 &self.state.upload_id,
                 parts,
                 CompleteMultipartMode::Overwrite,
+                self.state.extensions.clone(),
             )
             .await
     }
@@ -538,13 +567,12 @@ impl MultipartUpload for S3MultiPartUpload {
     async fn abort(&mut self) -> Result<()> {
         self.state
             .client
-            .request(Method::DELETE, &self.state.location)
-            .query(&[("uploadId", &self.state.upload_id)])
-            .idempotent(true)
-            .send()
-            .await?;
-
-        Ok(())
+            .abort_multipart(
+                &self.state.location,
+                &self.state.upload_id,
+                self.state.extensions.clone(),
+            )
+            .await
     }
 }
 
@@ -683,7 +711,13 @@ impl MultipartStore for AmazonS3 {
         data: PutPayload,
     ) -> Result<PartId> {
         self.client
-            .put_part(path, id, part_idx, PutPartPayload::Part(data))
+            .put_part(
+                path,
+                id,
+                part_idx,
+                PutPartPayload::Part(data),
+                Default::default(),
+            )
             .await
     }
 
@@ -694,17 +728,20 @@ impl MultipartStore for AmazonS3 {
         parts: Vec<PartId>,
     ) -> Result<PutResult> {
         self.client
-            .complete_multipart(path, id, parts, CompleteMultipartMode::Overwrite)
+            .complete_multipart(
+                path,
+                id,
+                parts,
+                CompleteMultipartMode::Overwrite,
+                Default::default(),
+            )
             .await
     }
 
     async fn abort_multipart(&self, path: &Path, id: &MultipartId) -> Result<()> {
         self.client
-            .request(Method::DELETE, path)
-            .query(&[("uploadId", id)])
-            .send()
-            .await?;
-        Ok(())
+            .abort_multipart(path, id, Default::default())
+            .await
     }
 }
 

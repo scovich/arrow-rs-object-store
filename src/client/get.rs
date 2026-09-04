@@ -525,17 +525,20 @@ mod tests {
 }
 #[cfg(all(test, feature = "http-base", not(target_arch = "wasm32")))]
 mod http_tests {
+    use super::{GetClient, GetClientExt, HeaderConfig};
     use crate::client::mock_server::MockServer;
-    use crate::client::{HttpError, HttpErrorKind, HttpResponseBody};
+    use crate::client::retry::RetryContext;
+    use crate::client::{HttpError, HttpErrorKind, HttpResponse, HttpResponseBody};
     use crate::http::HttpBuilder;
     use crate::path::Path;
-    use crate::{ClientOptions, ObjectStoreExt, RetryConfig};
+    use crate::{ClientOptions, GetOptions, ObjectStoreExt, Result, RetryConfig};
     use bytes::Bytes;
     use futures_util::FutureExt;
     use http::header::{CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, RANGE};
     use http::{Response, StatusCode};
     use hyper::body::Frame;
     use std::pin::Pin;
+    use std::sync::Arc;
     use std::task::{Context, Poll, ready};
     use std::time::Duration;
 
@@ -588,6 +591,91 @@ mod http_tests {
         fn from(value: Chunked) -> Self {
             Self::new(value)
         }
+    }
+
+    #[derive(Clone, Debug)]
+    struct CredentialScope(&'static str);
+
+    #[derive(Debug, Default)]
+    struct RecordingGetClient {
+        contexts: std::sync::Mutex<Vec<(String, Option<&'static str>)>>,
+        retry: RetryConfig,
+    }
+
+    #[async_trait::async_trait]
+    impl GetClient for RecordingGetClient {
+        const STORE: &'static str = "Recording";
+        const HEADER_CONFIG: HeaderConfig = HeaderConfig {
+            etag_required: true,
+            last_modified_required: false,
+            version_header: None,
+            user_defined_metadata_prefix: None,
+        };
+
+        fn retry_config(&self) -> &RetryConfig {
+            &self.retry
+        }
+
+        async fn get_request(
+            &self,
+            _ctx: &mut RetryContext,
+            path: &Path,
+            options: GetOptions,
+        ) -> Result<HttpResponse> {
+            let scope = options.extensions.get::<CredentialScope>().map(|v| v.0);
+            let mut contexts = self.contexts.lock().unwrap();
+            contexts.push((path.to_string(), scope));
+            let attempt = contexts.len();
+            drop(contexts);
+
+            let response = match attempt {
+                1 => Response::builder()
+                    .header(CONTENT_LENGTH, 2)
+                    .header(ETAG, "etag")
+                    .body(Chunked::new(vec![Ok(Bytes::from_static(b"a")), Err(())]))
+                    .unwrap()
+                    .map(HttpResponseBody::from),
+                2 => Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(CONTENT_LENGTH, 1)
+                    .header(CONTENT_RANGE, "bytes 1-1/2")
+                    .header(ETAG, "etag")
+                    .body(Bytes::from_static(b"b").into())
+                    .unwrap(),
+                _ => unreachable!(),
+            };
+            Ok(response)
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_recovery_preserves_request_extensions() {
+        let client = Arc::new(RecordingGetClient::default());
+        let mut extensions = http::Extensions::new();
+        extensions.insert(CredentialScope("table-a"));
+
+        let result = client
+            .get_opts(
+                &Path::from("table/object"),
+                GetOptions {
+                    extensions,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+
+        assert_eq!(result, Bytes::from_static(b"ab"));
+        assert_eq!(
+            *client.contexts.lock().unwrap(),
+            vec![
+                ("table/object".to_string(), Some("table-a")),
+                ("table/object".to_string(), Some("table-a")),
+            ]
+        );
     }
 
     #[cfg(feature = "reqwest")]

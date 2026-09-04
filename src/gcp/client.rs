@@ -24,7 +24,9 @@ use crate::client::s3::{
     CompleteMultipartUpload, CompleteMultipartUploadResult, InitiateMultipartUploadResult,
     ListResponse,
 };
-use crate::client::{CryptoProvider, GetOptionsExt, HttpClient, HttpError, HttpResponse};
+use crate::client::{
+    CredentialContext, CryptoProvider, GetOptionsExt, HttpClient, HttpError, HttpResponse,
+};
 use crate::gcp::credential::CredentialExt;
 use crate::gcp::{GcpCredential, GcpCredentialProvider, GcpSigningCredentialProvider, STORE};
 use crate::list::{PaginatedListOptions, PaginatedListResult};
@@ -158,9 +160,12 @@ impl GoogleCloudStorageConfig {
         format!("{}/{}/{}", self.base_url, self.bucket_name, path)
     }
 
-    pub(crate) async fn get_credential(&self) -> Result<Option<Arc<GcpCredential>>> {
+    pub(crate) async fn get_credential(
+        &self,
+        context: &CredentialContext<'_>,
+    ) -> Result<Option<Arc<GcpCredential>>> {
         Ok(match self.skip_signature {
-            false => Some(self.credentials.get_credential().await?),
+            false => Some(self.credentials.get_credential_ext(context).await?),
             true => None,
         })
     }
@@ -172,6 +177,7 @@ pub(crate) struct Request<'a> {
     config: &'a GoogleCloudStorageConfig,
     payload: Option<PutPayload>,
     builder: HttpRequestBuilder,
+    extensions: ::http::Extensions,
     idempotent: bool,
 }
 
@@ -229,15 +235,22 @@ impl Request<'_> {
     }
 
     fn with_extensions(self, extensions: ::http::Extensions) -> Self {
-        let builder = self.builder.extensions(extensions);
-        Self { builder, ..self }
+        let builder = self.builder.extensions(extensions.clone());
+        Self {
+            builder,
+            extensions,
+            ..self
+        }
     }
 
     async fn send(self) -> Result<HttpResponse> {
-        let credential = self.config.credentials.get_credential().await?;
-        let resp = self
-            .builder
-            .bearer_auth(&credential.bearer)
+        let context = CredentialContext {
+            path: self.path,
+            extensions: &self.extensions,
+        };
+        let credential = self.config.get_credential(&context).await?;
+        let builder = self.builder.with_bearer_auth(credential.as_deref());
+        let resp = builder
             .retryable(&self.config.retry_config)
             .idempotent(self.idempotent)
             .payload(self.payload)
@@ -303,8 +316,11 @@ impl GoogleCloudStorageClient {
         &self.config
     }
 
-    async fn get_credential(&self) -> Result<Option<Arc<GcpCredential>>> {
-        self.config.get_credential().await
+    async fn get_credential(
+        &self,
+        context: &CredentialContext<'_>,
+    ) -> Result<Option<Arc<GcpCredential>>> {
+        self.config.get_credential(context).await
     }
 
     /// Create a signature from a string-to-sign using Google Cloud signBlob method.
@@ -327,7 +343,14 @@ impl GoogleCloudStorageClient {
         string_to_sign: &str,
         client_email: &str,
     ) -> Result<String> {
-        let credential = self.get_credential().await?;
+        let path = Path::default();
+        let extensions = ::http::Extensions::new();
+        let credential = self
+            .get_credential(&CredentialContext {
+                path: &path,
+                extensions: &extensions,
+            })
+            .await?;
         let body = SignBlobBody {
             payload: BASE64_STANDARD.encode(string_to_sign),
         };
@@ -377,6 +400,7 @@ impl GoogleCloudStorageClient {
             builder,
             payload: None,
             config: &self.config,
+            extensions: Default::default(),
             idempotent: false,
         }
     }
@@ -427,6 +451,7 @@ impl GoogleCloudStorageClient {
         upload_id: &MultipartId,
         part_idx: usize,
         data: PutPayload,
+        extensions: ::http::Extensions,
     ) -> Result<PartId> {
         let query = &[
             ("partNumber", &format!("{}", part_idx + 1)),
@@ -435,6 +460,7 @@ impl GoogleCloudStorageClient {
         let result = self
             .request(Method::PUT, path)
             .with_payload(data)
+            .with_extensions(extensions)
             .query(query)
             .idempotent(true)
             .do_put()
@@ -485,12 +511,19 @@ impl GoogleCloudStorageClient {
         &self,
         path: &Path,
         multipart_id: &MultipartId,
+        extensions: ::http::Extensions,
     ) -> Result<()> {
-        let credential = self.get_credential().await?;
+        let credential = self
+            .get_credential(&CredentialContext {
+                path,
+                extensions: &extensions,
+            })
+            .await?;
         let url = self.object_url(path);
 
         self.client
             .request(Method::DELETE, &url)
+            .extensions(extensions)
             .with_bearer_auth(credential.as_deref())
             .header(CONTENT_TYPE, "application/octet-stream")
             .header(CONTENT_LENGTH, "0")
@@ -510,12 +543,21 @@ impl GoogleCloudStorageClient {
         path: &Path,
         multipart_id: &MultipartId,
         completed_parts: Vec<PartId>,
+        extensions: ::http::Extensions,
     ) -> Result<PutResult> {
         if completed_parts.is_empty() {
             // GCS doesn't allow empty multipart uploads, so fallback to regular upload.
-            self.multipart_cleanup(path, multipart_id).await?;
+            self.multipart_cleanup(path, multipart_id, extensions.clone())
+                .await?;
             let result = self
-                .put(path, PutPayload::new(), Default::default())
+                .put(
+                    path,
+                    PutPayload::new(),
+                    PutOptions {
+                        extensions,
+                        ..Default::default()
+                    },
+                )
                 .await?;
             return Ok(result);
         }
@@ -524,7 +566,12 @@ impl GoogleCloudStorageClient {
         let url = self.object_url(path);
 
         let upload_info = CompleteMultipartUpload::from(completed_parts);
-        let credential = self.get_credential().await?;
+        let credential = self
+            .get_credential(&CredentialContext {
+                path,
+                extensions: &extensions,
+            })
+            .await?;
 
         let data = quick_xml::se::to_string(&upload_info)
             .map_err(|source| Error::InvalidPutRequest { source })?
@@ -536,6 +583,7 @@ impl GoogleCloudStorageClient {
         let response = self
             .client
             .request(Method::POST, &url)
+            .extensions(extensions)
             .with_bearer_auth(credential.as_deref())
             .query(&[("uploadId", upload_id)])
             .body(data)
@@ -572,8 +620,19 @@ impl GoogleCloudStorageClient {
     }
 
     /// Perform a copy request <https://cloud.google.com/storage/docs/xml-api/put-object-copy>
-    pub(crate) async fn copy_request(&self, from: &Path, to: &Path, mode: CopyMode) -> Result<()> {
-        let credential = self.get_credential().await?;
+    pub(crate) async fn copy_request(
+        &self,
+        from: &Path,
+        to: &Path,
+        mode: CopyMode,
+        extensions: ::http::Extensions,
+    ) -> Result<()> {
+        let credential = self
+            .get_credential(&CredentialContext {
+                path: to,
+                extensions: &extensions,
+            })
+            .await?;
         let url = self.object_url(to);
 
         let from = utf8_percent_encode(from.as_ref(), NON_ALPHANUMERIC);
@@ -582,6 +641,7 @@ impl GoogleCloudStorageClient {
         let mut builder = self
             .client
             .request(Method::PUT, url)
+            .extensions(extensions)
             .header("x-goog-copy-source", source);
 
         let if_not_exists = match mode {
@@ -635,7 +695,12 @@ impl GetClient for GoogleCloudStorageClient {
         path: &Path,
         options: GetOptions,
     ) -> Result<HttpResponse> {
-        let credential = self.get_credential().await?;
+        let credential = self
+            .get_credential(&CredentialContext {
+                path,
+                extensions: &options.extensions,
+            })
+            .await?;
         let url = self.object_url(path);
 
         let method = match options.head {
@@ -672,7 +737,13 @@ impl ListClient for Arc<GoogleCloudStorageClient> {
         prefix: Option<&str>,
         opts: PaginatedListOptions,
     ) -> Result<PaginatedListResult> {
-        let credential = self.get_credential().await?;
+        let path = Path::from(prefix.unwrap_or_default());
+        let credential = self
+            .get_credential(&CredentialContext {
+                path: &path,
+                extensions: &opts.extensions,
+            })
+            .await?;
         let url = format!("{}/{}", self.config.base_url, self.bucket_name_encoded);
 
         let mut query = Vec::with_capacity(5);
